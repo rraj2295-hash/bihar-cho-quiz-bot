@@ -1,20 +1,37 @@
 import os
 import random
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, Poll
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
-    PollAnswerHandler,
     ContextTypes,
 )
 
 # Render पर Environment Variable से BOT_TOKEN लिया जाएगा
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
+# Render Web Service को संतुष्ट रखने के लिए हल्का HTTP Server
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Bihar CHO Quiz Bot is running healthy!")
+
+    def log_message(self, format, *args):
+        return  # कंसोल में फ़ालतू लॉग्स न दिखें
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    server.serve_forever()
+
 # Bihar CHO परीक्षा के लिए महत्वपूर्ण उच्च-प्राथमिकता प्रश्न बैंक
 QUIZ_QUESTIONS = [
     {
-        "question": "Asha worker covers a rural population of approximately:",
+        "question": "ASHA worker covers a rural population of approximately:",
         "options": ["500", "1,000", "2,500", "5,000"],
         "correct_option_id": 1,
         "explanation": "Generally, one ASHA (Accredited Social Health Activist) is designated per 1,000 rural population.",
@@ -96,8 +113,12 @@ def main():
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN environment variable सेट नहीं है!")
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    # 1. बैकग्राउंड थ्रेड में डमी वेब सर्वर शुरू करें (ताकि Render को खुला पोर्ट मिल जाए)
+    server_thread = threading.Thread(target=run_web_server, daemon=True)
+    server_thread.start()
 
+    # 2. Telegram Bot शुरू करें
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("quiz", send_quiz))
     app.add_handler(CommandHandler("help", help_command))
@@ -107,3 +128,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
