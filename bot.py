@@ -1,131 +1,177 @@
 import os
-import random
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from telegram import Update, Poll
+import json
+import asyncio
+from collections import defaultdict
+from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
+    MessageHandler,
+    PollAnswerHandler,
+    filters,
     ContextTypes,
 )
 
-# Render पर Environment Variable से BOT_TOKEN लिया जाएगा
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+# Render Environment Variables se read karega
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))  # Apna personal Telegram User ID dalein
 
-# Render Web Service को संतुष्ट रखने के लिए हल्का HTTP Server
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"Bihar CHO Quiz Bot is running healthy!")
+QUESTION_TIMER = 30  # Har question ka time seconds me
 
-    def log_message(self, format, *args):
-        return  # कंसोल में फ़ालतू लॉग्स न दिखें
+# Quiz states
+quiz_in_progress = False
+user_scores = defaultdict(int)
+user_names = {}
+active_polls = {}
 
-def run_web_server():
-    port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    server.serve_forever()
-
-# Bihar CHO परीक्षा के लिए महत्वपूर्ण उच्च-प्राथमिकता प्रश्न बैंक
-QUIZ_QUESTIONS = [
-    {
-        "question": "ASHA worker covers a rural population of approximately:",
-        "options": ["500", "1,000", "2,500", "5,000"],
-        "correct_option_id": 1,
-        "explanation": "Generally, one ASHA (Accredited Social Health Activist) is designated per 1,000 rural population.",
-    },
-    {
-        "question": "Which vaccine is administered to a newborn immediately at birth?",
-        "options": ["BCG, OPV, and Hepatitis B", "DPT and Measles", "Pentavalent and Rotavirus", "MMR only"],
-        "correct_option_id": 0,
-        "explanation": "Birth doses include BCG, OPV 0 dose, and Hepatitis B birth dose within 24 hours.",
-    },
-    {
-        "question": "The dose of Vitamin A solution given to an infant at 9 months of age is:",
-        "options": ["50,000 IU", "1,00,000 IU", "2,00,000 IU", "3,00,000 IU"],
-        "correct_option_id": 1,
-        "explanation": "The first dose of Vitamin A at 9 months with Measles/MR vaccine is 1 Lakh IU (1 ml). Subsequent doses are 2 Lakh IU.",
-    },
-    {
-        "question": "Exclusive breastfeeding is recommended up to what age?",
-        "options": ["3 months", "4 months", "6 months", "1 year"],
-        "correct_option_id": 2,
-        "explanation": "WHO and National Health Guidelines recommend exclusive breastfeeding for the first 6 months of life.",
-    },
-    {
-        "question": "In a Community Health Center (CHC), the standard bed capacity is usually:",
-        "options": ["10 beds", "30 beds", "50 beds", "100 beds"],
-        "correct_option_id": 1,
-        "explanation": "A standard Community Health Centre (CHC) is designed as a 30-bedded hospital serving as a referral unit.",
-    },
-    {
-        "question": "The antidote for Magnesium Sulfate (MgSO4) toxicity in eclampsia management is:",
-        "options": ["Calcium Gluconate", "Potassium Chloride", "Sodium Bicarbonate", "Naloxone"],
-        "correct_option_id": 0,
-        "explanation": "10% Calcium Gluconate (10 ml given IV slowly) is the specific antidote for MgSO4 toxicity.",
-    },
-    {
-        "question": "Kangaroo Mother Care (KMC) is primarily indicated for:",
-        "options": ["Post-term babies", "Low Birth Weight (LBW) babies", "Babies with birth asphyxia", "Macrosomic infants"],
-        "correct_option_id": 1,
-        "explanation": "KMC is an effective method for the care of Low Birth Weight (LBW) and preterm neonates.",
-    },
-    {
-        "question": "Under the National Immunization Schedule, the Pentavalent vaccine protects against:",
-        "options": [
-            "Diphtheria, Pertussis, Tetanus, Polio, Measles",
-            "Diphtheria, Pertussis, Tetanus, Hepatitis B, Hib",
-            "TB, Polio, Tetanus, Hepatitis B, Rubella",
-            "Diphtheria, Mumps, Measles, Rubella, Hib"
-        ],
-        "correct_option_id": 1,
-        "explanation": "Pentavalent vaccine protects against Diphtheria, Pertussis, Tetanus, Hepatitis B, and Haemophilus influenzae type b (Hib).",
-    },
-]
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    welcome_text = (
-        "🏥 **Bihar CHO Quiz Bot में आपका स्वागत है!**\n\n"
-        "कमांड्स:\n"
-        "👉 /quiz - एक नया प्रश्न हल करें\n"
-        "👉 /help - सहायता प्राप्त करें"
-    )
-    await update.message.reply_text(welcome_text, parse_mode="Markdown")
-
-async def send_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    item = random.choice(QUIZ_QUESTIONS)
-    await update.message.reply_poll(
-        question=item["question"],
-        options=item["options"],
-        type=Poll.QUIZ,
-        correct_option_id=item["correct_option_id"],
-        explanation=item["explanation"],
-        is_anonymous=False,
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Namaste! Naya quiz run karne ke liye:\n"
+        "1. `/newquiz` command bhejein.\n"
+        "2. Bot ke mangne par nayi JSON file upload karein."
     )
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = "नया सवाल पाने के लिए बस /quiz टाइप करके भेजें।"
-    await update.message.reply_text(help_text)
+async def ask_for_quiz_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global quiz_in_progress
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ Aapko quiz shuru karne ki permission nahi hai.")
+        return
+
+    if quiz_in_progress:
+        await update.message.reply_text("⚠️ Ek quiz pehle se chal raha hai. Uske khatam hone tak wait karein.")
+        return
+
+    context.user_data["waiting_for_file"] = True
+    await update.message.reply_text("📂 Kripya naye quiz ki `.json` file upload karein.")
+
+async def handle_json_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global quiz_in_progress, user_scores, user_names, active_polls
+
+    if not context.user_data.get("waiting_for_file"):
+        return
+
+    doc = update.message.document
+    if not doc.file_name.endswith(".json"):
+        await update.message.reply_text("❌ Kripya valid `.json` file hi bhejein.")
+        return
+
+    file = await doc.get_file()
+    file_bytes = await file.download_as_bytearray()
+
+    try:
+        quiz_data = json.loads(file_bytes.decode("utf-8"))
+    except Exception as e:
+        await update.message.reply_text(f"❌ JSON file padhne me error aayi: {e}")
+        return
+
+    context.user_data["waiting_for_file"] = False
+    target_chat_id = os.environ.get("TARGET_CHAT_ID")  # Group/Channel ID
+
+    await update.message.reply_text(f"✅ File receive ho gayi! Total {len(quiz_data)} questions group me shuru ho rahe hain...")
+
+    # State reset
+    quiz_in_progress = True
+    user_scores.clear()
+    user_names.clear()
+    active_polls.clear()
+
+    # Background task me quiz start karein
+    asyncio.create_task(run_quiz(context.bot, target_chat_id, quiz_data))
+
+async def run_quiz(bot, chat_id, quiz_data):
+    global quiz_in_progress
+    mapping = {"A": 0, "B": 1, "C": 2, "D": 3}
+    total_q = len(quiz_data)
+
+    await bot.send_message(
+        chat_id=chat_id,
+        text=f"🎯 *New Quiz Shuru Ho Raha Hai!*\n\n📊 Total Questions: {total_q}\n⏱️ Time per Question: {QUESTION_TIMER}s\n\nTaiyar ho jayein sabhi log!",
+        parse_mode="Markdown"
+    )
+    await asyncio.sleep(4)
+
+    for item in quiz_data:
+        q_num = item.get("number", "")
+        q_text = f"Q{q_num}. {item['question']}"
+        options_dict = item.get("options", {})
+        options = [v for k, v in options_dict.items()]
+
+        if len(options) < 2:
+            continue
+
+        correct_letter = item.get("answer", "A").strip().upper()
+        correct_index = mapping.get(correct_letter, 0)
+        if correct_index >= len(options):
+            correct_index = 0
+
+        try:
+            msg = await bot.send_poll(
+                chat_id=chat_id,
+                question=q_text[:300],
+                options=[opt[:100] for opt in options],
+                type="quiz",
+                correct_option_id=correct_index,
+                is_anonymous=False,
+                open_period=QUESTION_TIMER
+            )
+            active_polls[msg.poll.id] = correct_index
+            await asyncio.sleep(QUESTION_TIMER + 2)
+        except Exception as e:
+            print(f"Error sending poll: {e}")
+            await asyncio.sleep(3)
+
+    # Quiz khatam hone par scorecard
+    await send_leaderboard(bot, chat_id, total_q)
+    quiz_in_progress = False
+
+async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    answer = update.poll_answer
+    poll_id = answer.poll_id
+    user = answer.user
+
+    full_name = f"{user.first_name} {user.last_name or ''}".strip()
+    user_names[user.id] = full_name
+
+    if poll_id in active_polls:
+        correct_option_id = active_polls[poll_id]
+        if answer.option_ids and answer.option_ids[0] == correct_option_id:
+            user_scores[user.id] += 1
+
+async def send_leaderboard(bot, chat_id, total_q):
+    if not user_names:
+        await bot.send_message(chat_id=chat_id, text="🏁 Quiz samaapt ho gaya! Kisi candidate ne attempt nahi kiya.")
+        return
+
+    sorted_users = sorted(user_names.keys(), key=lambda uid: user_scores[uid], reverse=True)
+    topper_id = sorted_users[0]
+    topper_name = user_names[topper_id]
+    topper_score = user_scores[topper_id]
+
+    res = "🏆 *QUIZ COMPLETED - FINAL RESULT* 🏆\n"
+    res += "═══════════════════════\n\n"
+    res += f"🥇 *TOPPER: {topper_name}*\n"
+    res += f"🎯 Score: `{topper_score}/{total_q}` Marks\n"
+    res += "🎉 Congratulations to the Winner! 👏\n\n"
+    res += "═══════════════════════\n"
+    res += "📋 *Scorecard:*\n\n"
+
+    emojis = {1: "🥇", 2: "🥈", 3: "🥉"}
+    for rank, uid in enumerate(sorted_users, start=1):
+        badge = emojis.get(rank, f"#{rank}")
+        res += f"{badge} {user_names[uid]}: `{user_scores[uid]}/{total_q}`\n"
+
+    await bot.send_message(chat_id=chat_id, text=res, parse_mode="Markdown")
 
 def main():
-    if not BOT_TOKEN:
-        raise ValueError("BOT_TOKEN environment variable सेट नहीं है!")
-
-    # 1. बैकग्राउंड थ्रेड में डमी वेब सर्वर शुरू करें (ताकि Render को खुला पोर्ट मिल जाए)
-    server_thread = threading.Thread(target=run_web_server, daemon=True)
-    server_thread.start()
-
-    # 2. Telegram Bot शुरू करें
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("quiz", send_quiz))
-    app.add_handler(CommandHandler("help", help_command))
 
-    print("Bihar CHO Quiz Bot चालू हो गया है...")
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("newquiz", ask_for_quiz_file))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_json_file))
+    app.add_handler(PollAnswerHandler(handle_poll_answer))
+
+    print("Bot live hai aur updates sun raha hai...")
     app.run_polling()
 
 if __name__ == "__main__":
     main()
-    
