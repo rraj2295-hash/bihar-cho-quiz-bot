@@ -37,6 +37,9 @@ QUESTION_TIMER = 30  # Har question ka time seconds me
 
 # Quiz states
 quiz_in_progress = False
+quiz_paused = False
+pause_event = asyncio.Event()
+pause_event.set()  # Default state: Unpaused
 user_scores = defaultdict(int)
 user_names = {}
 active_polls = {}
