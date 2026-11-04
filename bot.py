@@ -43,7 +43,7 @@ pause_event.set()  # Default state: Unpaused
 user_scores = defaultdict(int)
 user_names = {}
 active_polls = {}
-
+background_tasks = set()
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Namaste! Naya quiz run karne ke liye:\n"
@@ -95,8 +95,10 @@ async def handle_json_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_names.clear()
     active_polls.clear()
 
-    # Background task me quiz start karein
-    asyncio.create_task(run_quiz(context.bot, target_chat_id, quiz_data))
+    # Background task me quiz start karein  
+task = asyncio.create_task(run_quiz(context.bot, TARGET_CHAT_ID, quiz_data))
+background_tasks.add(task)
+task.add_done_callback(background_tasks.discard)
 
 async def run_quiz(bot, chat_id, quiz_data):
     global quiz_in_progress
