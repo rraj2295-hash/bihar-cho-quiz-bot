@@ -85,20 +85,27 @@ async def handle_json_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     context.user_data["waiting_for_file"] = False
-    target_chat_id = os.environ.get("TARGET_CHAT_ID")  # Group/Channel ID
+            
+        # TARGET_CHAT_ID ko int me convert karein
+        raw_chat_id = os.environ.get("TARGET_CHAT_ID")
+        if not raw_chat_id:
+            await update.message.reply_text("❌ Error: TARGET_CHAT_ID environment variable set nahi hai!")
+            return
+        target_chat_id = int(raw_chat_id)
 
-    await update.message.reply_text(f"✅ File receive ho gayi! Total {len(quiz_data)} questions group me shuru ho rahe hain...")
+        await update.message.reply_text(f"✅ File receive ho gayi! Total {len(quiz_data)} questions group me shuru ho rahe hain...")
 
-    # State reset
-    quiz_in_progress = True
-    user_scores.clear()
-    user_names.clear()
-    active_polls.clear()
-    
-    # Background task me quiz start karein
-    task = asyncio.create_task(run_quiz(context.bot, TARGET_CHAT_ID, quiz_data))
-    background_tasks.add(task)
-    task.add_done_callback(background_tasks.discard)
+        # state reset
+        quiz_in_progress = True
+        user_scores.clear()
+        user_names.clear()
+        active_polls.clear()
+
+        # Background task me target_chat_id pass karein (same lowercase name)
+        task = asyncio.create_task(run_quiz(context.bot, target_chat_id, quiz_data))
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
+
     
 async def run_quiz(bot, chat_id, quiz_data):
     global quiz_in_progress
