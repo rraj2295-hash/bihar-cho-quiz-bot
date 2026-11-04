@@ -86,12 +86,12 @@ async def handle_json_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["waiting_for_file"] = False
             
-        # TARGET_CHAT_ID ko int me convert karein
-        raw_chat_id = os.environ.get("TARGET_CHAT_ID")
-        if not raw_chat_id:
-            await update.message.reply_text("❌ Error: TARGET_CHAT_ID environment variable set nahi hai!")
-            return
-        target_chat_id = int(raw_chat_id)
+    # TARGET_CHAT_ID ko int me convert karein
+    raw_chat_id = os.environ.get("TARGET_CHAT_ID")
+    if not raw_chat_id:
+       await update.message.reply_text("❌ Error: TARGET_CHAT_ID environment variable set nahi hai!")
+       return
+     target_chat_id = int(raw_chat_id)
 
         await update.message.reply_text(f"✅ File receive ho gayi! Total {len(quiz_data)} questions group me shuru ho rahe hain...")
 
