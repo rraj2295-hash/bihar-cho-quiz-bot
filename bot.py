@@ -1,24 +1,9 @@
 import os
-import threading
-from flask import Flask
-
-web_app = Flask(__name__)
-
-@web_app.route('/')
-def home():
-    return "Bot is running!"
-
-def run_web():
-    port = int(os.environ.get("PORT", 8080))
-    web_app.run(host="0.0.0.0", port=port)
-
-# Web server background thread me start karein
-threading.Thread(target=run_web, daemon=True).start()
-
-import os
 import json
 import asyncio
+import threading
 from collections import defaultdict
+from flask import Flask
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -29,9 +14,24 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# Render Environment Variables se read karega
+# --- Flask Web Server Setup (Render ke port bind ke liye) ---
+web_app = Flask(__name__)
+
+@web_app.route("/")
+def home():
+    return "Bot is running!"
+
+def run_web():
+    port = int(os.environ.get("PORT", 8080))
+    web_app.run(host="0.0.0.0", port=port)
+
+# Web server background thread me start karein
+threading.Thread(target=run_web, daemon=True).start()
+
+
+# --- Render Environment Variables & Config ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))  # Apna personal Telegram User ID dalein
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))  # Apna personal Telegram User ID
 
 QUESTION_TIMER = 30  # Har question ka time seconds me
 
@@ -44,12 +44,15 @@ user_scores = defaultdict(int)
 user_names = {}
 active_polls = {}
 background_tasks = set()
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Namaste! Naya quiz run karne ke liye:\n"
         "1. `/newquiz` command bhejein.\n"
         "2. Bot ke mangne par nayi JSON file upload karein."
     )
+
 
 async def ask_for_quiz_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global quiz_in_progress
@@ -63,6 +66,7 @@ async def ask_for_quiz_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["waiting_for_file"] = True
     await update.message.reply_text("📂 Kripya naye quiz ki `.json` file upload karein.")
+
 
 async def handle_json_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global quiz_in_progress, user_scores, user_names, active_polls
@@ -85,28 +89,28 @@ async def handle_json_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     context.user_data["waiting_for_file"] = False
-            
+
     # TARGET_CHAT_ID ko int me convert karein
     raw_chat_id = os.environ.get("TARGET_CHAT_ID")
     if not raw_chat_id:
-       await update.message.reply_text("❌ Error: TARGET_CHAT_ID environment variable set nahi hai!")
-       return
-     target_chat_id = int(raw_chat_id)
+        await update.message.reply_text("❌ Error: TARGET_CHAT_ID environment variable set nahi hai!")
+        return
+    target_chat_id = int(raw_chat_id)
 
-        await update.message.reply_text(f"✅ File receive ho gayi! Total {len(quiz_data)} questions group me shuru ho rahe hain...")
+    await update.message.reply_text(f"✅ File receive ho gayi! Total {len(quiz_data)} questions group me shuru ho rahe hain...")
 
-        # state reset
-        quiz_in_progress = True
-        user_scores.clear()
-        user_names.clear()
-        active_polls.clear()
+    # state reset
+    quiz_in_progress = True
+    user_scores.clear()
+    user_names.clear()
+    active_polls.clear()
 
-        # Background task me target_chat_id pass karein (same lowercase name)
-        task = asyncio.create_task(run_quiz(context.bot, target_chat_id, quiz_data))
-        background_tasks.add(task)
-        task.add_done_callback(background_tasks.discard)
+    # Background task me quiz start karein
+    task = asyncio.create_task(run_quiz(context.bot, target_chat_id, quiz_data))
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
 
-    
+
 async def run_quiz(bot, chat_id, quiz_data):
     global quiz_in_progress
     mapping = {"A": 0, "B": 1, "C": 2, "D": 3}
@@ -121,7 +125,7 @@ async def run_quiz(bot, chat_id, quiz_data):
 
     for item in quiz_data:
         q_num = item.get("number", "")
-        q_text = f"Q{q_num}. {item['question']}"
+        q_text = f"Q{q_num}. {item.get('question', '')}"
         options_dict = item.get("options", {})
         options = [v for k, v in options_dict.items()]
 
@@ -153,6 +157,7 @@ async def run_quiz(bot, chat_id, quiz_data):
     await send_leaderboard(bot, chat_id, total_q)
     quiz_in_progress = False
 
+
 async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     answer = update.poll_answer
     poll_id = answer.poll_id
@@ -165,6 +170,7 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
         correct_option_id = active_polls[poll_id]
         if answer.option_ids and answer.option_ids[0] == correct_option_id:
             user_scores[user.id] += 1
+
 
 async def send_leaderboard(bot, chat_id, total_q):
     if not user_names:
@@ -196,7 +202,12 @@ async def error_handler(update, context):
     """Network drop ya Bad Gateway par bot ko crash hone se roke"""
     print(f"Ignored Network Glitch: {context.error}")
 
+
 def main():
+    if not BOT_TOKEN:
+        print("BOT_TOKEN set nahi hai!")
+        return
+
     # Timeouts badhayein taaki Bad Gateway aur connection drop na ho
     app = (
         ApplicationBuilder()
@@ -219,6 +230,7 @@ def main():
 
     print("Bot live hai aur updates sun raha hai...")
     app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
