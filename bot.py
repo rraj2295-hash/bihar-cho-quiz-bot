@@ -94,12 +94,12 @@ async def handle_json_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_scores.clear()
     user_names.clear()
     active_polls.clear()
-
-    # Background task me quiz start karein  
-task = asyncio.create_task(run_quiz(context.bot, TARGET_CHAT_ID, quiz_data))
-background_tasks.add(task)
-task.add_done_callback(background_tasks.discard)
-
+    
+    # Background task me quiz start karein
+    task = asyncio.create_task(run_quiz(context.bot, TARGET_CHAT_ID, quiz_data))
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
+    
 async def run_quiz(bot, chat_id, quiz_data):
     global quiz_in_progress
     mapping = {"A": 0, "B": 1, "C": 2, "D": 3}
