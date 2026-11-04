@@ -184,16 +184,35 @@ async def send_leaderboard(bot, chat_id, total_q):
 
     await bot.send_message(chat_id=chat_id, text=res, parse_mode="Markdown")
 
-def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
+async def error_handler(update, context):
+    """Network drop ya Bad Gateway par bot ko crash hone se roke"""
+    print(f"Ignored Network Glitch: {context.error}")
+
+def main():
+    # Timeouts badhayein taaki Bad Gateway aur connection drop na ho
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .connect_timeout(30.0)
+        .read_timeout(30.0)
+        .write_timeout(30.0)
+        .pool_timeout(30.0)
+        .build()
+    )
+
+    # Command handlers
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("newquiz", ask_for_quiz_file))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_json_file))
     app.add_handler(PollAnswerHandler(handle_poll_answer))
 
+    # Error handler register karein
+    app.add_error_handler(error_handler)
+
     print("Bot live hai aur updates sun raha hai...")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
+    
