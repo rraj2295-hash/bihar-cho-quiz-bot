@@ -56,6 +56,14 @@ def init_db():
                 payload TEXT NOT NULL
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS saved_quizzes (
+                quiz_id TEXT PRIMARY KEY,
+                quiz_name TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                saved_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
 def save_state():
     if quiz_state is None:
@@ -76,6 +84,39 @@ def load_state():
     return json.loads(row[0]) if row else None
 
 
+def archive_current_quiz():
+    """Keep a paused quiz as a separate resumable entry."""
+    if not quiz_state:
+        return None
+    import time
+    quiz_id = str(int(time.time()))
+    name = quiz_state.get("quiz_name") or f"Quiz-{quiz_id}"
+    payload = json.dumps(quiz_state, ensure_ascii=False)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO saved_quizzes (quiz_id, quiz_name, payload) VALUES (?, ?, ?)",
+            (quiz_id, name, payload),
+        )
+    return quiz_id
+
+
+def list_saved_quizzes():
+    with sqlite3.connect(DB_PATH) as conn:
+        return conn.execute(
+            "SELECT quiz_id, quiz_name, json_extract(payload, '$.current_index'), json_extract(payload, '$.total') "
+            "FROM saved_quizzes ORDER BY saved_at DESC"
+        ).fetchall()
+
+
+def get_saved_quiz(quiz_id=None):
+    with sqlite3.connect(DB_PATH) as conn:
+        if quiz_id:
+            row = conn.execute("SELECT quiz_id, payload FROM saved_quizzes WHERE quiz_id=?", (quiz_id,)).fetchone()
+        else:
+            row = conn.execute("SELECT quiz_id, payload FROM saved_quizzes ORDER BY saved_at DESC LIMIT 1").fetchone()
+    return row
+
+
 def is_admin(update: Update) -> bool:
     return bool(update.effective_user and update.effective_user.id == ADMIN_ID and ADMIN_ID != 0)
 
@@ -86,7 +127,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 Namaste! Quiz control commands:\n"
         "/newquiz - Nayi JSON quiz upload karein (admin)\n"
         "/pause - Chal raha quiz pause karein (admin)\n"
-        "/resume - Quiz wahi se resume karein (admin)\n"
+        "/resume [ID] - Purana quiz wahi se resume karein (admin)\n"
+        "/savedquizzes - Saved quizzes ki list dekhein (admin)\n"
         "/status - Quiz progress dekhein\n"
         "/stop - Quiz band karein (admin)"
     )
@@ -99,11 +141,11 @@ async def ask_for_quiz_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Sirf admin naya quiz shuru kar sakta hai.")
         return
 
-    if quiz_state and quiz_state.get("status") in ("running", "paused"):
-        await update.message.reply_text(
-            "⚠️ Ek quiz pehle se active hai. Pehle /stop karein ya use complete hone dein."
-        )
+    if quiz_state and quiz_state.get("status") == "running":
+        await update.message.reply_text("⚠️ Pehle /pause karein, phir nayi JSON upload karein.")
         return
+    if quiz_state and quiz_state.get("status") == "paused":
+        await update.message.reply_text("⏸️ Current quiz paused hai. Ab nayi JSON upload kar sakte hain; purana quiz saved rahega.")
 
     context.user_data["waiting_for_file"] = True
     await update.message.reply_text("📂 Kripya valid `.json` quiz file upload karein.")
@@ -144,7 +186,20 @@ async def handle_json_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     context.user_data["waiting_for_file"] = False
+
+    # Preserve the paused quiz before switching to the newly uploaded quiz.
+    archived_id = None
+    if quiz_state and quiz_state.get("status") == "paused":
+        archived_id = archive_current_quiz()
+        if quiz_task is not None and not quiz_task.done():
+            quiz_task.cancel()
+            try:
+                await quiz_task
+            except asyncio.CancelledError:
+                pass
+
     quiz_state = {
+        "quiz_name": Path(doc.file_name).stem,
         "chat_id": int(raw_chat_id),
         "quiz_data": quiz_data,
         "current_index": 0,
@@ -157,8 +212,9 @@ async def handle_json_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     active_polls.clear()
     pause_event.set()
 
+    saved_note = f"\n🗂️ Purana quiz ID: {archived_id} ( /resume {archived_id} se wapas la sakte hain)." if archived_id else ""
     await update.message.reply_text(
-        f"✅ JSON receive ho gayi! Total {len(quiz_data)} questions shuru ho rahe hain."
+        f"✅ JSON receive ho gayi! Total {len(quiz_data)} questions shuru ho rahe hain.{saved_note}"
     )
     quiz_task = asyncio.create_task(run_quiz(context.bot))
 
@@ -185,20 +241,66 @@ async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         await update.message.reply_text("❌ Sirf admin quiz resume kar sakta hai.")
         return
-    if not quiz_state or quiz_state.get("status") != "paused":
-        await update.message.reply_text("⚠️ Koi paused quiz nahi hai.")
+
+    requested_id = context.args[0] if context.args else None
+    # No ID: resume the currently paused quiz, if one exists.
+    if quiz_state and quiz_state.get("status") == "paused" and not requested_id:
+        quiz_state["status"] = "running"
+        save_state()
+        pause_event.set()
+        if quiz_task is None or quiz_task.done():
+            quiz_task = asyncio.create_task(run_quiz(context.bot))
+        await update.message.reply_text(
+            f"▶️ Quiz resume ho gaya! Progress: {quiz_state['current_index']}/{quiz_state['total']} questions complete."
+        )
         return
 
+    # An ID (or no active paused quiz) selects an archived quiz.
+    row = get_saved_quiz(requested_id)
+    if not row:
+        await update.message.reply_text("⚠️ Saved quiz nahi mila. /savedquizzes se IDs dekhein.")
+        return
+
+    if quiz_state and quiz_state.get("status") == "running":
+        await update.message.reply_text("⚠️ Pehle current quiz ko /pause karein.")
+        return
+    if quiz_state and quiz_state.get("status") == "paused":
+        archive_current_quiz()
+
+    selected_id, payload = row
+    quiz_state = json.loads(payload)
     quiz_state["status"] = "running"
     save_state()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM saved_quizzes WHERE quiz_id=?", (selected_id,))
+    active_polls.clear()
     pause_event.set()
-
-    if quiz_task is None or quiz_task.done():
-        quiz_task = asyncio.create_task(run_quiz(context.bot))
-
+    if quiz_task is not None and not quiz_task.done():
+        quiz_task.cancel()
+        try:
+            await quiz_task
+        except asyncio.CancelledError:
+            pass
+    quiz_task = asyncio.create_task(run_quiz(context.bot))
     await update.message.reply_text(
-        f"▶️ Quiz resume ho gaya! Progress: {quiz_state['current_index']}/{quiz_state['total']} questions complete."
+        f"▶️ {quiz_state.get('quiz_name', 'Purana Quiz')} resume ho gaya! "
+        f"Progress: {quiz_state.get('current_index', 0)}/{quiz_state.get('total', 0)}."
     )
+
+
+async def savedquizzes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        await update.message.reply_text("❌ Sirf admin saved quizzes dekh sakta hai.")
+        return
+    rows = list_saved_quizzes()
+    if not rows:
+        await update.message.reply_text("Koi archived quiz nahi hai.")
+        return
+    lines = ["🗂️ Saved quizzes:"]
+    for quiz_id, name, done, total in rows:
+        lines.append(f"• {name} | ID: {quiz_id} | Progress: {done or 0}/{total or 0}")
+    lines.append("Resume: /resume ID")
+    await update.message.reply_text("\n".join(lines))
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -392,6 +494,7 @@ def main():
     app.add_handler(CommandHandler("newquiz", ask_for_quiz_file))
     app.add_handler(CommandHandler("pause", pause_command))
     app.add_handler(CommandHandler("resume", resume_command))
+    app.add_handler(CommandHandler("savedquizzes", savedquizzes_command))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("stop", stop_command))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_json_file))
@@ -404,3 +507,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+        
