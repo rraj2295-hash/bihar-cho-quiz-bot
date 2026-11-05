@@ -1,12 +1,13 @@
 import os
 import json
 import time
+import urllib.parse
 import asyncio
 import sqlite3
 import threading
 from pathlib import Path
 from flask import Flask
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -117,13 +118,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *Namaste! Quiz Bot Commands:*\n\n"
         "🔹 `/newquiz` - Nayi JSON quiz file upload karein (admin)\n"
-        "🔹 `/restart` - Current quiz ko shuru se restart karein (admin)\n"
-        "🔹 `/share` - Quiz invite aur details share karein\n"
+        "🔹 `/restart` - Current ya Completed quiz ko shuru se restart karein (admin)\n"
+        "🔹 `/share` - Quiz invite aur details direct chat me share karein\n"
         "🔹 `/pause` - Chal raha quiz pause karein (admin)\n"
         "🔹 `/resume [ID]` - Paused quiz jaari karein (admin)\n"
         "🔹 `/savedquizzes` - Archived quizzes ki list dekhein (admin)\n"
         "🔹 `/status` - Current quiz progress check karein\n"
-        "🔹 `/stop` - Quiz ko poori tarah band karein (admin)",
+        "🔹 `/stop` - Quiz ko band karein (admin)",
         parse_mode="Markdown"
     )
 
@@ -164,16 +165,15 @@ async def handle_json_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ JSON file error: {exc}")
         return
 
-    # Temporary store in context
     context.user_data["temp_quiz_data"] = quiz_data
     context.user_data["temp_quiz_name"] = Path(doc.file_name).stem
     context.user_data["waiting_for_file"] = False
     context.user_data["waiting_for_timer"] = True
 
     await update.message.reply_text(
-        f"✅ *JSON Safal:* Total {len(quiz_data)} questions mile.\n\n"
-        f"⏱️ Har question ke liye timer set karein (seconds me reply karein):\n"
-        f"Udaharan: `15`, `30`, `45`, ya `60` likh kar bhejein.",
+        f"✅ *JSON File Valid:* Kul {len(quiz_data)} questions load hue hain.\n\n"
+        f"⏱️ Har question ke liye timer kitna rakhna hai? (seconds me likhein):\n"
+        f"Example: `15`, `30`, `45`, ya `60` reply karein.",
         parse_mode="Markdown"
     )
 
@@ -200,7 +200,7 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
     quiz_name = context.user_data.get("temp_quiz_name")
 
     archived_id = None
-    if quiz_state and quiz_state.get("status") == "paused":
+    if quiz_state and quiz_state.get("status") in ("running", "paused"):
         archived_id = archive_current_quiz()
         if quiz_task is not None and not quiz_task.done():
             quiz_task.cancel()
@@ -241,9 +241,10 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not quiz_state or not quiz_state.get("quiz_data"):
-        await update.message.reply_text("⚠️ Restart karne ke liye koi quiz loaded nahi hai.")
+        await update.message.reply_text("⚠️ Restart karne ke liye koi quiz nahi mila. Kripya /newquiz se upload karein.")
         return
 
+    # Background me agar koi running task hai to use safely cancel karein
     if quiz_task is not None and not quiz_task.done():
         quiz_task.cancel()
         try:
@@ -251,6 +252,7 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except asyncio.CancelledError:
             pass
 
+    # Status chahe 'completed' ho ya 'running'/'paused', sab reset karke Q1 se chalu karein
     quiz_state["current_index"] = 0
     quiz_state["scores"] = {}
     quiz_state["names"] = {}
@@ -259,30 +261,46 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     active_polls.clear()
     pause_event.set()
 
-    await update.message.reply_text(f"🔄 *Quiz Restart ho gaya!* Q1 se shuru kiya ja raha hai...", parse_mode="Markdown")
+    await update.message.reply_text(
+        f"🔄 *Quiz Restart Kiya Gaya!*\n\n"
+        f"📖 *Topic:* {quiz_state.get('quiz_name', 'Mock Test')}\n"
+        f"Question 1 se fir se sabhi poll shuru ho rahe hain...",
+        parse_mode="Markdown"
+    )
     quiz_task = asyncio.create_task(run_quiz(context.bot))
 
 async def share_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not quiz_state or not quiz_state.get("quiz_data"):
-        await update.message.reply_text("Abhi koi active quiz nahi hai jise share kiya ja sake.")
+        await update.message.reply_text("Abhi koi active ya completed quiz nahi hai jise share kiya ja sake.")
         return
 
     name = quiz_state.get("quiz_name", "Live Quiz")
     total = quiz_state.get("total", len(quiz_state.get("quiz_data", [])))
     timer = quiz_state.get("timer", DEFAULT_TIMER)
-    done = quiz_state.get("current_index", 0)
 
-    share_text = (
-        f"📢 *LIVE QUIZ ANNOUNCEMENT* 🎯\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
+    bot_info = await context.bot.get_me()
+    bot_username = bot_info.username
+
+    share_msg = (
+        f"🎯 *Live Quiz me hissa lein!*\n\n"
         f"📖 *Topic:* {name}\n"
         f"📝 *Total Questions:* {total}\n"
-        f"⏱️ *Time per Question:* {timer} seconds\n"
-        f"📊 *Current Progress:* {done}/{total} Done\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"⚡ Sabhi candidates turant group join karke answers submit karein!"
+        f"⏱️ *Time Limit:* {timer} seconds\n\n"
+        f"👉 Join karke test attempt karein: @{bot_username}"
     )
-    await update.message.reply_text(share_text, parse_mode="Markdown")
+
+    encoded_text = urllib.parse.quote(share_msg)
+    share_url = f"https://t.me/share/url?text={encoded_text}"
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📲 Dosto ko Share Karein", url=share_url)]
+    ])
+
+    await update.message.reply_text(
+        f"📢 *Quiz Invite Tayyar Hai!*\nNeeche diye button se kisi bhi friend ya group ko direct share karein:",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
 
 async def pause_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global quiz_state
@@ -296,7 +314,7 @@ async def pause_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     quiz_state["status"] = "paused"
     save_state()
     pause_event.clear()
-    await update.message.reply_text("⏸️ Quiz pause ho gaya hai. Agla question ruk chuka hai. /resume se shuru karein.")
+    await update.message.reply_text("⏸️ Quiz pause ho gaya hai. Agla question ruk gaya hai. /resume se jaari karein.")
 
 async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global quiz_state, quiz_task
@@ -410,10 +428,10 @@ async def run_quiz(bot):
                     "🔥 *QUIZ SHURU HO RAHA HAI!* 🔥\n"
                     "━━━━━━━━━━━━━━━━━━\n"
                     f"📖 *Topic:* {quiz_state.get('quiz_name', 'Mock Test')}\n"
-                    f"📊 *Questions:* {total_q}\n"
-                    f"⏱️ *Per Question Time:* {timer}s\n"
+                    f"📊 *Total Questions:* {total_q}\n"
+                    f"⏱️ *Timer:* {timer} seconds\n"
                     "━━━━━━━━━━━━━━━━━━\n"
-                    "👉 Sabhi log sahi vikalp chunein!"
+                    "👉 Sabhi candidates taiyar ho jayein!"
                 ),
                 parse_mode="Markdown",
             )
@@ -466,9 +484,9 @@ async def run_quiz(bot):
         save_state()
 
     if quiz_state and quiz_state.get("status") == "running":
-        await send_leaderboard(bot, chat_id, total_q)
         quiz_state["status"] = "completed"
         save_state()
+        await send_leaderboard(bot, chat_id, total_q)
 
 
 async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -493,14 +511,25 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
     save_state()
 
 
-# ---------------- Stylish Leaderboard ----------------
+# ---------------- Stylish Leaderboard with Direct Share Button ----------------
 async def send_leaderboard(bot, chat_id, total_q):
     names = quiz_state.get("names", {})
     scores = quiz_state.get("scores", {})
     quiz_name = quiz_state.get("quiz_name", "Test")
 
+    bot_info = await bot.get_me()
+    bot_username = bot_info.username
+
     if not names:
-        await bot.send_message(chat_id=chat_id, text="🏁 Quiz samaapt! Kisi candidate ne attempt nahi kiya.")
+        await bot.send_message(
+            chat_id=chat_id, 
+            text=(
+                "🏁 *Quiz Complete ho gaya!*\n\n"
+                "Kisi bhi candidate ne attempt nahi kiya.\n"
+                "Usi quiz ko fir se chalane ke liye admin `/restart` bhej sakte hain."
+            ),
+            parse_mode="Markdown"
+        )
         return
 
     sorted_users = sorted(names.keys(), key=lambda uid: scores.get(uid, 0), reverse=True)
@@ -512,15 +541,15 @@ async def send_leaderboard(bot, chat_id, total_q):
         "╔════════════════════════╗\n"
         "       🏆 *FINAL LEADERBOARD* 🏆\n"
         "╚════════════════════════╝\n\n"
-        f"📖 *Quiz:* {quiz_name}\n"
-        f"📊 *Total Questions:* {total_q}\n"
+        f"📖 *Topic:* {quiz_name}\n"
+        f"📊 *Questions:* {total_q}\n"
         f"👥 *Total Participants:* {len(sorted_users)}\n"
         "────────────────────────\n\n"
-        f"👑 *TOP PERFORMER*\n"
+        f"👑 *TOPPER (RANK 1)*\n"
         f"🥇 *{names[topper_id]}*\n"
         f"🎯 *Score:* `{topper_score}/{total_q}` ({topper_pct}%)\n"
         "🌟 _Outstanding Performance!_ 👏\n\n"
-        "📋 *TOP CANDIDATES RANKING:*\n"
+        "📋 *TOP CANDIDATES SCORECARD:*\n"
     )
 
     rank_icons = {1: "🥇", 2: "🥈", 3: "🥉"}
@@ -532,10 +561,18 @@ async def send_leaderboard(bot, chat_id, total_q):
 
     res += (
         "\n────────────────────────\n"
-        "✨ _Shandar prayas! Agle quiz ki taiyari jaari rakhein._ 📚"
+        "🔄 *Admin Note:* Is test ko dobara lene ke liye `/restart` karein."
     )
 
-    await bot.send_message(chat_id=chat_id, text=res, parse_mode="Markdown")
+    share_text = f"🏆 *{quiz_name} Result:* Topper {names[topper_id]} bane `{topper_score}/{total_q}` score ke saath! Agle quiz ke liye judiye: @{bot_username}"
+    encoded_share = urllib.parse.quote(share_text)
+    share_url = f"https://t.me/share/url?text={encoded_share}"
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📲 Result Dosto Ko Share Karein", url=share_url)]
+    ])
+
+    await bot.send_message(chat_id=chat_id, text=res, reply_markup=keyboard, parse_mode="Markdown")
 
 
 # ---------------- Startup / Errors ----------------
