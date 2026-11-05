@@ -191,10 +191,9 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
     timer_val = int(text)
     context.user_data["waiting_for_timer"] = False
 
+    # Agar TARGET_CHAT_ID env me nahi hai to usi chat me send karega
     raw_chat_id = os.environ.get("TARGET_CHAT_ID")
-    if not raw_chat_id:
-        await update.message.reply_text("❌ Render Environment me TARGET_CHAT_ID set nahi hai.")
-        return
+    target_chat = int(raw_chat_id) if raw_chat_id else update.effective_chat.id
 
     quiz_data = context.user_data.get("temp_quiz_data")
     quiz_name = context.user_data.get("temp_quiz_name")
@@ -211,7 +210,8 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
 
     quiz_state = {
         "quiz_name": quiz_name,
-        "chat_id": int(raw_chat_id),
+        "chat_id": target_chat,
+        "admin_chat_id": update.effective_chat.id,
         "quiz_data": quiz_data,
         "current_index": 0,
         "timer": timer_val,
@@ -229,7 +229,8 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
         f"🚀 *Quiz Start Ho Raha Hai!*\n\n"
         f"📌 *Topic:* {quiz_name}\n"
         f"📊 *Questions:* {len(quiz_data)}\n"
-        f"⏱️ *Timer:* {timer_val}s per question{saved_note}",
+        f"⏱️ *Timer:* {timer_val}s per question\n"
+        f"🎯 *Target Chat ID:* `{target_chat}`{saved_note}",
         parse_mode="Markdown"
     )
     quiz_task = asyncio.create_task(run_quiz(context.bot))
@@ -244,7 +245,6 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Restart karne ke liye koi quiz nahi mila. Kripya /newquiz se upload karein.")
         return
 
-    # Background me agar koi running task hai to use safely cancel karein
     if quiz_task is not None and not quiz_task.done():
         quiz_task.cancel()
         try:
@@ -252,7 +252,6 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except asyncio.CancelledError:
             pass
 
-    # Status chahe 'completed' ho ya 'running'/'paused', sab reset karke Q1 se chalu karein
     quiz_state["current_index"] = 0
     quiz_state["scores"] = {}
     quiz_state["names"] = {}
@@ -415,6 +414,7 @@ async def run_quiz(bot):
         return
 
     chat_id = quiz_state["chat_id"]
+    admin_chat = quiz_state.get("admin_chat_id", chat_id)
     quiz_data = quiz_state["quiz_data"]
     total_q = len(quiz_data)
     timer = quiz_state.get("timer", DEFAULT_TIMER)
@@ -436,7 +436,13 @@ async def run_quiz(bot):
                 parse_mode="Markdown",
             )
         except Exception as exc:
-            print(f"Start message error: {exc}")
+            err_msg = f"⚠️ Quiz Start Message Error (Chat ID `{chat_id}`): {exc}"
+            print(err_msg)
+            if admin_chat != chat_id:
+                try:
+                    await bot.send_message(chat_id=admin_chat, text=err_msg, parse_mode="Markdown")
+                except Exception:
+                    pass
 
     while quiz_state and quiz_state.get("current_index", 0) < total_q:
         await pause_event.wait()
@@ -477,7 +483,13 @@ async def run_quiz(bot):
             active_polls[poll_msg.poll.id] = correct_index
             await asyncio.sleep(timer + 2)
         except Exception as exc:
-            print(f"Poll send error: {exc}")
+            err_msg = f"⚠️ Poll Error: {exc}"
+            print(err_msg)
+            if admin_chat != chat_id:
+                try:
+                    await bot.send_message(chat_id=admin_chat, text=err_msg)
+                except Exception:
+                    pass
             await asyncio.sleep(3)
 
         quiz_state["current_index"] = index + 1
@@ -511,14 +523,11 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
     save_state()
 
 
-# ---------------- Stylish Leaderboard with Direct Share Button ----------------
+# ---------------- Leaderboard ----------------
 async def send_leaderboard(bot, chat_id, total_q):
     names = quiz_state.get("names", {})
     scores = quiz_state.get("scores", {})
     quiz_name = quiz_state.get("quiz_name", "Test")
-
-    bot_info = await bot.get_me()
-    bot_username = bot_info.username
 
     if not names:
         await bot.send_message(
@@ -533,103 +542,47 @@ async def send_leaderboard(bot, chat_id, total_q):
         return
 
     sorted_users = sorted(names.keys(), key=lambda uid: scores.get(uid, 0), reverse=True)
-    topper_id = sorted_users[0]
-    topper_score = scores.get(topper_id, 0)
-    topper_pct = round((topper_score / total_q) * 100, 1) if total_q > 0 else 0
+    res = [
+        "╔════════════════════════╗",
+        "       🏆 *FINAL LEADERBOARD* 🏆",
+        "╚════════════════════════╝\n",
+        f"📖 *Topic:* {quiz_name}",
+        f"📊 *Questions:* {total_q}\n",
+    ]
 
-    res = (
-        "╔════════════════════════╗\n"
-        "       🏆 *FINAL LEADERBOARD* 🏆\n"
-        "╚════════════════════════╝\n\n"
-        f"📖 *Topic:* {quiz_name}\n"
-        f"📊 *Questions:* {total_q}\n"
-        f"👥 *Total Participants:* {len(sorted_users)}\n"
-        "────────────────────────\n\n"
-        f"👑 *TOPPER (RANK 1)*\n"
-        f"🥇 *{names[topper_id]}*\n"
-        f"🎯 *Score:* `{topper_score}/{total_q}` ({topper_pct}%)\n"
-        "🌟 _Outstanding Performance!_ 👏\n\n"
-        "📋 *TOP CANDIDATES SCORECARD:*\n"
-    )
-
-    rank_icons = {1: "🥇", 2: "🥈", 3: "🥉"}
-    for rank, uid in enumerate(sorted_users[:15], start=1):
+    medals = ["🥇", "🥈", "🥉"]
+    for i, uid in enumerate(sorted_users[:10]):
+        rank_icon = medals[i] if i < 3 else f"{i+1}."
         sc = scores.get(uid, 0)
         pct = round((sc / total_q) * 100, 1) if total_q > 0 else 0
-        icon = rank_icons.get(rank, f"`#{rank:02d}`")
-        res += f"{icon} *{names[uid]}* ➔ `{sc}/{total_q}` ({pct}%)\n"
+        res.append(f"{rank_icon} *{names[uid]}* — {sc}/{total_q} ({pct}%)")
 
-    res += (
-        "\n────────────────────────\n"
-        "🔄 *Admin Note:* Is test ko dobara lene ke liye `/restart` karein."
-    )
-
-    share_text = f"🏆 *{quiz_name} Result:* Topper {names[topper_id]} bane `{topper_score}/{total_q}` score ke saath! Agle quiz ke liye judiye: @{bot_username}"
-    encoded_share = urllib.parse.quote(share_text)
-    share_url = f"https://t.me/share/url?text={encoded_share}"
-
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📲 Result Dosto Ko Share Karein", url=share_url)]
-    ])
-
-    await bot.send_message(chat_id=chat_id, text=res, reply_markup=keyboard, parse_mode="Markdown")
+    await bot.send_message(chat_id=chat_id, text="\n".join(res), parse_mode="Markdown")
 
 
-# ---------------- Startup / Errors ----------------
-async def restore_quiz(application):
-    global quiz_state, quiz_task
+# ---------------- Application Entrypoint ----------------
+def main():
+    init_db()
+    global quiz_state
     quiz_state = load_state()
 
-    if quiz_state and quiz_state.get("status") == "running":
-        pause_event.set()
-        quiz_task = asyncio.create_task(run_quiz(application.bot))
-        print(">> Running quiz SQLite se restore ho gaya.")
-    elif quiz_state and quiz_state.get("status") == "paused":
-        pause_event.clear()
-        print(">> Quiz paused hai. /resume se continue karein.")
-    else:
-        pause_event.set()
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
 
-async def error_handler(update, context):
-    print(f">> Telegram Error: {context.error}")
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("newquiz", ask_for_quiz_file))
+    application.add_handler(CommandHandler("restart", restart_command))
+    application.add_handler(CommandHandler("share", share_command))
+    application.add_handler(CommandHandler("pause", pause_command))
+    application.add_handler(CommandHandler("resume", resume_command))
+    application.add_handler(CommandHandler("savedquizzes", savedquizzes_command))
+    application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("stop", stop_command))
 
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_json_file))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_messages))
+    application.add_handler(PollAnswerHandler(handle_poll_answer))
 
-def main():
-    token = os.environ.get("BOT_TOKEN")
-    if not token:
-        print("❌ CRITICAL ERROR: BOT_TOKEN Environment variable set nahi hai!")
-        while True:
-            time.sleep(3600)
-
-    init_db()
-
-    app = (
-        ApplicationBuilder()
-        .token(token)
-        .connect_timeout(30.0)
-        .read_timeout(30.0)
-        .write_timeout(30.0)
-        .pool_timeout(30.0)
-        .post_init(restore_quiz)
-        .build()
-    )
-
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("newquiz", ask_for_quiz_file))
-    app.add_handler(CommandHandler("restart", restart_command))
-    app.add_handler(CommandHandler("share", share_command))
-    app.add_handler(CommandHandler("pause", pause_command))
-    app.add_handler(CommandHandler("resume", resume_command))
-    app.add_handler(CommandHandler("savedquizzes", savedquizzes_command))
-    app.add_handler(CommandHandler("status", status_command))
-    app.add_handler(CommandHandler("stop", stop_command))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_json_file))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_messages))
-    app.add_handler(PollAnswerHandler(handle_poll_answer))
-    app.add_error_handler(error_handler)
-
-    print(">> Telegram Quiz Bot polling shuru ho chuki hai...")
-    app.run_polling(drop_pending_updates=False)
+    application.run_polling()
 
 if __name__ == "__main__":
     main()
