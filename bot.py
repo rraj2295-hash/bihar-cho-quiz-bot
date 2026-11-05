@@ -3,6 +3,7 @@ import json
 import asyncio
 import sqlite3
 import threading
+import uuid
 from pathlib import Path
 from flask import Flask
 from telegram import Update
@@ -43,6 +44,8 @@ DB_PATH = DATA_DIR / "quiz_progress.sqlite3"
 pause_event = asyncio.Event()
 pause_event.set()
 active_polls = {}   # poll_id -> correct option index
+share_poll_map = {} # poll_id -> {user_id, correct_index}
+shared_sessions = {} # user_id -> per-user shared quiz session
 quiz_task = None
 quiz_state = None
 
@@ -62,6 +65,14 @@ def init_db():
                 quiz_name TEXT NOT NULL,
                 payload TEXT NOT NULL,
                 saved_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS completed_quizzes (
+                quiz_id TEXT PRIMARY KEY,
+                quiz_name TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
 
@@ -117,20 +128,122 @@ def get_saved_quiz(quiz_id=None):
     return row
 
 
+def save_completed_quiz():
+    """Save an immutable copy of a completed quiz for sharing."""
+    if not quiz_state or quiz_state.get("status") != "completed":
+        return None
+    if quiz_state.get("share_id"):
+        return quiz_state["share_id"]
+    quiz_id = uuid.uuid4().hex[:12]
+    name = quiz_state.get("quiz_name") or f"Quiz-{quiz_id}"
+    payload_data = {
+        "quiz_name": name,
+        "quiz_data": quiz_state.get("quiz_data", []),
+        "total": quiz_state.get("total", len(quiz_state.get("quiz_data", []))),
+    }
+    payload = json.dumps(payload_data, ensure_ascii=False)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT INTO completed_quizzes (quiz_id, quiz_name, payload) VALUES (?, ?, ?)",
+            (quiz_id, name, payload),
+        )
+    quiz_state["share_id"] = quiz_id
+    save_state()
+    return quiz_id
+
+
+def list_completed_quizzes():
+    with sqlite3.connect(DB_PATH) as conn:
+        return conn.execute(
+            "SELECT quiz_id, quiz_name, created_at FROM completed_quizzes ORDER BY created_at DESC"
+        ).fetchall()
+
+
+def get_completed_quiz(quiz_id):
+    with sqlite3.connect(DB_PATH) as conn:
+        return conn.execute(
+            "SELECT quiz_id, quiz_name, payload FROM completed_quizzes WHERE quiz_id=?",
+            (quiz_id,),
+        ).fetchone()
+
+
 def is_admin(update: Update) -> bool:
     return bool(update.effective_user and update.effective_user.id == ADMIN_ID and ADMIN_ID != 0)
 
 
 # ---------------- Commands ----------------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Deep-link format: https://t.me/BotUsername?start=share_QUIZID
+    if context.args and context.args[0].startswith("share_"):
+        quiz_id = context.args[0][6:]
+        row = get_completed_quiz(quiz_id)
+        if not row:
+            await update.message.reply_text("⚠️ Yeh shared quiz link valid nahi hai ya quiz available nahi hai.")
+            return
+        try:
+            quiz_payload = json.loads(row[2])
+        except Exception:
+            await update.message.reply_text("❌ Is quiz ka data read nahi ho pa raha hai.")
+            return
+        uid = str(update.effective_user.id)
+        if uid in shared_sessions:
+            await update.message.reply_text("⏳ Aapka ek shared quiz pehle se chal raha hai. Pehle use complete karein.")
+            return
+        task = asyncio.create_task(run_shared_quiz(context.bot, update.effective_chat.id, uid, quiz_id, quiz_payload))
+        shared_sessions[uid] = {"task": task, "score": 0, "answers": {}, "name": row[1]}
+        await update.message.reply_text(f"✅ {row[1]} shuru ho raha hai! Har question ka jawab select karein.")
+        return
+
     await update.message.reply_text(
         "👋 Namaste! Quiz control commands:\n"
         "/newquiz - Nayi JSON quiz upload karein (admin)\n"
         "/pause - Chal raha quiz pause karein (admin)\n"
         "/resume [ID] - Purana quiz wahi se resume karein (admin)\n"
         "/savedquizzes - Saved quizzes ki list dekhein (admin)\n"
+        "/completedquizzes - Completed Quiz list (admin)\n"
+        "/sharequiz ID - Completed Quiz ka link banayein (admin)\n"
         "/status - Quiz progress dekhein\n"
         "/stop - Quiz band karein (admin)"
+    )
+
+
+async def completedquizzes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        await update.message.reply_text("❌ Sirf admin completed quizzes dekh sakta hai.")
+        return
+    # Import the latest completed quiz from older bot versions, if present.
+    save_completed_quiz()
+    rows = list_completed_quizzes()
+    if not rows:
+        await update.message.reply_text("Abhi koi Completed Quiz share ke liye save nahi hua.")
+        return
+    lines = ["🏁 Completed Quizzes:"]
+    for quiz_id, name, created_at in rows:
+        lines.append(f"• {name} | ID: {quiz_id} | {created_at}")
+    lines.append("\nShare link banane ke liye: /sharequiz ID")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def sharequiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        await update.message.reply_text("❌ Sirf admin Quiz Share Link bana sakta hai.")
+        return
+    if not context.args:
+        await update.message.reply_text("Pehle /completedquizzes bhejein, phir /sharequiz ID use karein.")
+        return
+    # Ensure a completed quiz from the previous bot version is also shareable.
+    save_completed_quiz()
+    quiz_id = context.args[0].strip()
+    row = get_completed_quiz(quiz_id)
+    if not row:
+        await update.message.reply_text("⚠️ Is ID ka Completed Quiz nahi mila. /completedquizzes dekhein.")
+        return
+    me = await context.bot.get_me()
+    link = f"https://t.me/{me.username}?start=share_{quiz_id}"
+    await update.message.reply_text(
+        f"📤 *Quiz Share Link Ready!*\n\n📚 Quiz: {row[1]}\n\n🔗 {link}\n\nIs link ko Group, Channel ya students ke saath share karein. Student link kholkar Start dabayega aur apna quiz attempt karega.",
+        parse_mode="Markdown",
+        disable_web_page_preview=True,
     )
 
 
@@ -405,106 +518,18 @@ async def run_quiz(bot):
         await send_leaderboard(bot, chat_id, total_q)
         quiz_state["status"] = "completed"
         save_state()
+        completed_id = save_completed_quiz()
+        print(f"Completed quiz archived for sharing. ID: {completed_id}")
 
 
 async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not quiz_state:
-        return
-
     answer = update.poll_answer
-    user = answer.user
-    full_name = f"{user.first_name} {user.last_name or ''}".strip()
 
-    if answer.poll_id not in active_polls:
-        return
-
-    correct_option_id = active_polls[answer.poll_id]
-    uid = str(user.id)
-    quiz_state.setdefault("names", {})[uid] = full_name
-    quiz_state.setdefault("scores", {}).setdefault(uid, 0)
-
-    if answer.option_ids and answer.option_ids[0] == correct_option_id:
-        quiz_state["scores"][uid] += 1
-
-    save_state()
-
-
-async def send_leaderboard(bot, chat_id, total_q):
-    names = quiz_state.get("names", {})
-    scores = quiz_state.get("scores", {})
-
-    if not names:
-        await bot.send_message(chat_id=chat_id, text="🏁 Quiz samaapt! Kisi candidate ne attempt nahi kiya.")
-        return
-
-    sorted_users = sorted(names.keys(), key=lambda uid: scores.get(uid, 0), reverse=True)
-    topper_id = sorted_users[0]
-
-    result = "🏆 *QUIZ COMPLETED - FINAL RESULT* 🏆\n"
-    result += "═══════════════════════\n\n"
-    result += f"🥇 *TOPPER: {names[topper_id]}*\n"
-    result += f"🎯 Score: `{scores.get(topper_id, 0)}/{total_q}` Marks\n"
-    result += "🎉 Congratulations! 👏\n\n📋 *Scorecard:*\n\n"
-
-    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-    for rank, uid in enumerate(sorted_users, start=1):
-        result += f"{medals.get(rank, f'#{rank}')} {names[uid]}: `{scores.get(uid, 0)}/{total_q}`\n"
-
-    await bot.send_message(chat_id=chat_id, text=result, parse_mode="Markdown")
-
-
-# ---------------- Startup / errors ----------------
-async def restore_quiz(application):
-    global quiz_state, quiz_task
-    quiz_state = load_state()
-
-    if quiz_state and quiz_state.get("status") == "running":
-        pause_event.set()
-        quiz_task = asyncio.create_task(run_quiz(application.bot))
-        print("Saved quiz restored from SQLite.")
-    elif quiz_state and quiz_state.get("status") == "paused":
-        pause_event.clear()
-        print("Saved quiz is paused. Admin can send /resume.")
-    else:
-        pause_event.set()
-
-
-async def error_handler(update, context):
-    print(f"Telegram/network error: {context.error}")
-
-
-def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN environment variable set nahi hai.")
-
-    init_db()
-
-    app = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .connect_timeout(30.0)
-        .read_timeout(30.0)
-        .write_timeout(30.0)
-        .pool_timeout(30.0)
-        .post_init(restore_quiz)
-        .build()
-    )
-
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("newquiz", ask_for_quiz_file))
-    app.add_handler(CommandHandler("pause", pause_command))
-    app.add_handler(CommandHandler("resume", resume_command))
-    app.add_handler(CommandHandler("savedquizzes", savedquizzes_command))
-    app.add_handler(CommandHandler("status", status_command))
-    app.add_handler(CommandHandler("stop", stop_command))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_json_file))
-    app.add_handler(PollAnswerHandler(handle_poll_answer))
-    app.add_error_handler(error_handler)
-
-    print("Bot live hai aur updates sun raha hai...")
-    app.run_polling(drop_pending_updates=False)
-
-
-if __name__ == "__main__":
-    main()
-        
+    # Poll answers from individual shared-quiz sessions
+    shared_info = share_poll_map.get(answer.poll_id)
+    if shared_info:
+        uid = shared_info["user_id"]
+        session = shared_sessions.get(uid)
+        if session is not None:
+            was_correct = session["answers"].get(answer.poll_id, False)
+ 
