@@ -1,9 +1,9 @@
 import os
 import json
+import time
 import asyncio
 import sqlite3
 import threading
-import uuid
 from pathlib import Path
 from flask import Flask
 from telegram import Update
@@ -16,41 +16,37 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# ---------------- Render Web Service ----------------
+# ---------------- Render Web Service (Port Binding) ----------------
 web_app = Flask(__name__)
 
 @web_app.route("/")
 def home():
-    return "Telegram Quiz Bot is running!"
+    return "Telegram Quiz Bot is running successfully!"
 
 def run_web():
     port = int(os.environ.get("PORT", 8080))
-    web_app.run(host="0.0.0.0", port=port)
+    web_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
-threading.Thread(target=run_web, daemon=True).start()
+flask_thread = threading.Thread(target=run_web, daemon=True)
+flask_thread.start()
 
-# ---------------- Configuration ----------------
+# ---------------- Configuration & Persistence Setup ----------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
-QUESTION_TIMER = int(os.environ.get("QUESTION_TIMER", "30"))
+DEFAULT_TIMER = int(os.environ.get("QUESTION_TIMER", "30"))
 
-# On Render, set DATA_DIR=/var/data and attach a Persistent Disk at /var/data.
-# Locally, it uses a ./data folder.
 DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "quiz_progress.sqlite3"
 
-# In-memory runtime objects. Durable quiz progress is stored in SQLite.
 pause_event = asyncio.Event()
 pause_event.set()
 active_polls = {}   # poll_id -> correct option index
-share_poll_map = {} # poll_id -> {user_id, correct_index}
-shared_sessions = {} # user_id -> per-user shared quiz session
 quiz_task = None
 quiz_state = None
 
 
-# ---------------- SQLite persistence ----------------
+# ---------------- SQLite Persistence ----------------
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
@@ -67,14 +63,6 @@ def init_db():
                 saved_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS completed_quizzes (
-                quiz_id TEXT PRIMARY KEY,
-                quiz_name TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
 
 def save_state():
     if quiz_state is None:
@@ -89,17 +77,12 @@ def save_state():
 
 def load_state():
     with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute(
-            "SELECT payload FROM quiz_state WHERE id = 1"
-        ).fetchone()
+        row = conn.execute("SELECT payload FROM quiz_state WHERE id = 1").fetchone()
     return json.loads(row[0]) if row else None
 
-
 def archive_current_quiz():
-    """Keep a paused quiz as a separate resumable entry."""
     if not quiz_state:
         return None
-    import time
     quiz_id = str(int(time.time()))
     name = quiz_state.get("quiz_name") or f"Quiz-{quiz_id}"
     payload = json.dumps(quiz_state, ensure_ascii=False)
@@ -110,14 +93,12 @@ def archive_current_quiz():
         )
     return quiz_id
 
-
 def list_saved_quizzes():
     with sqlite3.connect(DB_PATH) as conn:
         return conn.execute(
             "SELECT quiz_id, quiz_name, json_extract(payload, '$.current_index'), json_extract(payload, '$.total') "
             "FROM saved_quizzes ORDER BY saved_at DESC"
         ).fetchall()
-
 
 def get_saved_quiz(quiz_id=None):
     with sqlite3.connect(DB_PATH) as conn:
@@ -127,129 +108,27 @@ def get_saved_quiz(quiz_id=None):
             row = conn.execute("SELECT quiz_id, payload FROM saved_quizzes ORDER BY saved_at DESC LIMIT 1").fetchone()
     return row
 
-
-def save_completed_quiz():
-    """Save an immutable copy of a completed quiz for sharing."""
-    if not quiz_state or quiz_state.get("status") != "completed":
-        return None
-    if quiz_state.get("share_id"):
-        return quiz_state["share_id"]
-    quiz_id = uuid.uuid4().hex[:12]
-    name = quiz_state.get("quiz_name") or f"Quiz-{quiz_id}"
-    payload_data = {
-        "quiz_name": name,
-        "quiz_data": quiz_state.get("quiz_data", []),
-        "total": quiz_state.get("total", len(quiz_state.get("quiz_data", []))),
-    }
-    payload = json.dumps(payload_data, ensure_ascii=False)
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            "INSERT INTO completed_quizzes (quiz_id, quiz_name, payload) VALUES (?, ?, ?)",
-            (quiz_id, name, payload),
-        )
-    quiz_state["share_id"] = quiz_id
-    save_state()
-    return quiz_id
-
-
-def list_completed_quizzes():
-    with sqlite3.connect(DB_PATH) as conn:
-        return conn.execute(
-            "SELECT quiz_id, quiz_name, created_at FROM completed_quizzes ORDER BY created_at DESC"
-        ).fetchall()
-
-
-def get_completed_quiz(quiz_id):
-    with sqlite3.connect(DB_PATH) as conn:
-        return conn.execute(
-            "SELECT quiz_id, quiz_name, payload FROM completed_quizzes WHERE quiz_id=?",
-            (quiz_id,),
-        ).fetchone()
-
-
 def is_admin(update: Update) -> bool:
     return bool(update.effective_user and update.effective_user.id == ADMIN_ID and ADMIN_ID != 0)
 
 
 # ---------------- Commands ----------------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Deep-link format: https://t.me/BotUsername?start=share_QUIZID
-    if context.args and context.args[0].startswith("share_"):
-        quiz_id = context.args[0][6:]
-        row = get_completed_quiz(quiz_id)
-        if not row:
-            await update.message.reply_text("⚠️ Yeh shared quiz link valid nahi hai ya quiz available nahi hai.")
-            return
-        try:
-            quiz_payload = json.loads(row[2])
-        except Exception:
-            await update.message.reply_text("❌ Is quiz ka data read nahi ho pa raha hai.")
-            return
-        uid = str(update.effective_user.id)
-        if uid in shared_sessions:
-            await update.message.reply_text("⏳ Aapka ek shared quiz pehle se chal raha hai. Pehle use complete karein.")
-            return
-        task = asyncio.create_task(run_shared_quiz(context.bot, update.effective_chat.id, uid, quiz_id, quiz_payload))
-        shared_sessions[uid] = {"task": task, "score": 0, "answers": {}, "name": row[1]}
-        await update.message.reply_text(f"✅ {row[1]} shuru ho raha hai! Har question ka jawab select karein.")
-        return
-
     await update.message.reply_text(
-        "👋 Namaste! Quiz control commands:\n"
-        "/newquiz - Nayi JSON quiz upload karein (admin)\n"
-        "/pause - Chal raha quiz pause karein (admin)\n"
-        "/resume [ID] - Purana quiz wahi se resume karein (admin)\n"
-        "/savedquizzes - Saved quizzes ki list dekhein (admin)\n"
-        "/completedquizzes - Completed Quiz list (admin)\n"
-        "/sharequiz ID - Completed Quiz ka link banayein (admin)\n"
-        "/status - Quiz progress dekhein\n"
-        "/stop - Quiz band karein (admin)"
+        "👋 *Namaste! Quiz Bot Commands:*\n\n"
+        "🔹 `/newquiz` - Nayi JSON quiz file upload karein (admin)\n"
+        "🔹 `/restart` - Current quiz ko shuru se restart karein (admin)\n"
+        "🔹 `/share` - Quiz invite aur details share karein\n"
+        "🔹 `/pause` - Chal raha quiz pause karein (admin)\n"
+        "🔹 `/resume [ID]` - Paused quiz jaari karein (admin)\n"
+        "🔹 `/savedquizzes` - Archived quizzes ki list dekhein (admin)\n"
+        "🔹 `/status` - Current quiz progress check karein\n"
+        "🔹 `/stop` - Quiz ko poori tarah band karein (admin)",
+        parse_mode="Markdown"
     )
-
-
-async def completedquizzes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        await update.message.reply_text("❌ Sirf admin completed quizzes dekh sakta hai.")
-        return
-    # Import the latest completed quiz from older bot versions, if present.
-    save_completed_quiz()
-    rows = list_completed_quizzes()
-    if not rows:
-        await update.message.reply_text("Abhi koi Completed Quiz share ke liye save nahi hua.")
-        return
-    lines = ["🏁 Completed Quizzes:"]
-    for quiz_id, name, created_at in rows:
-        lines.append(f"• {name} | ID: {quiz_id} | {created_at}")
-    lines.append("\nShare link banane ke liye: /sharequiz ID")
-    await update.message.reply_text("\n".join(lines))
-
-
-async def sharequiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        await update.message.reply_text("❌ Sirf admin Quiz Share Link bana sakta hai.")
-        return
-    if not context.args:
-        await update.message.reply_text("Pehle /completedquizzes bhejein, phir /sharequiz ID use karein.")
-        return
-    # Ensure a completed quiz from the previous bot version is also shareable.
-    save_completed_quiz()
-    quiz_id = context.args[0].strip()
-    row = get_completed_quiz(quiz_id)
-    if not row:
-        await update.message.reply_text("⚠️ Is ID ka Completed Quiz nahi mila. /completedquizzes dekhein.")
-        return
-    me = await context.bot.get_me()
-    link = f"https://t.me/{me.username}?start=share_{quiz_id}"
-    await update.message.reply_text(
-        f"📤 *Quiz Share Link Ready!*\n\n📚 Quiz: {row[1]}\n\n🔗 {link}\n\nIs link ko Group, Channel ya students ke saath share karein. Student link kholkar Start dabayega aur apna quiz attempt karega.",
-        parse_mode="Markdown",
-        disable_web_page_preview=True,
-    )
-
 
 async def ask_for_quiz_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global quiz_state
-
     if not is_admin(update):
         await update.message.reply_text("❌ Sirf admin naya quiz shuru kar sakta hai.")
         return
@@ -257,24 +136,18 @@ async def ask_for_quiz_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if quiz_state and quiz_state.get("status") == "running":
         await update.message.reply_text("⚠️ Pehle /pause karein, phir nayi JSON upload karein.")
         return
-    if quiz_state and quiz_state.get("status") == "paused":
-        await update.message.reply_text("⏸️ Current quiz paused hai. Ab nayi JSON upload kar sakte hain; purana quiz saved rahega.")
 
     context.user_data["waiting_for_file"] = True
+    context.user_data["waiting_for_timer"] = False
     await update.message.reply_text("📂 Kripya valid `.json` quiz file upload karein.")
 
-
 async def handle_json_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global quiz_state, quiz_task
-
-    if not context.user_data.get("waiting_for_file"):
-        return
-    if not is_admin(update):
+    if not context.user_data.get("waiting_for_file") or not is_admin(update):
         return
 
     doc = update.message.document
-    if not doc.file_name or not doc.file_name.lower().endswith(".json"):
-        await update.message.reply_text("❌ Kripya `.json` file hi bhejein.")
+    if not doc or not doc.file_name or not doc.file_name.lower().endswith(".json"):
+        await update.message.reply_text("❌ Kripya sirf `.json` file hi bhejein.")
         return
 
     tg_file = await doc.get_file()
@@ -283,24 +156,49 @@ async def handle_json_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         quiz_data = json.loads(file_bytes.decode("utf-8"))
         if not isinstance(quiz_data, list) or not quiz_data:
-            raise ValueError("JSON ka top-level format non-empty questions ki list hona chahiye.")
+            raise ValueError("JSON ka format non-empty questions ki list hona chahiye.")
         for i, item in enumerate(quiz_data, start=1):
             if not isinstance(item, dict) or "question" not in item or "options" not in item or "answer" not in item:
-                raise ValueError(f"Question {i} me question/options/answer field missing hai.")
-            if not isinstance(item["options"], dict):
-                raise ValueError(f"Question {i} ka options object valid nahi hai.")
+                raise ValueError(f"Question {i} me question/options/answer missing hai.")
     except Exception as exc:
-        await update.message.reply_text(f"❌ JSON file me error: {exc}")
+        await update.message.reply_text(f"❌ JSON file error: {exc}")
         return
+
+    # Temporary store in context
+    context.user_data["temp_quiz_data"] = quiz_data
+    context.user_data["temp_quiz_name"] = Path(doc.file_name).stem
+    context.user_data["waiting_for_file"] = False
+    context.user_data["waiting_for_timer"] = True
+
+    await update.message.reply_text(
+        f"✅ *JSON Safal:* Total {len(quiz_data)} questions mile.\n\n"
+        f"⏱️ Har question ke liye timer set karein (seconds me reply karein):\n"
+        f"Udaharan: `15`, `30`, `45`, ya `60` likh kar bhejein.",
+        parse_mode="Markdown"
+    )
+
+async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global quiz_state, quiz_task
+
+    if not context.user_data.get("waiting_for_timer") or not is_admin(update):
+        return
+
+    text = update.message.text.strip()
+    if not text.isdigit() or int(text) < 10 or int(text) > 300:
+        await update.message.reply_text("⚠️ Kripya 10 se 300 seconds ke beech ka koi number bhejein (jaise: 30).")
+        return
+
+    timer_val = int(text)
+    context.user_data["waiting_for_timer"] = False
 
     raw_chat_id = os.environ.get("TARGET_CHAT_ID")
     if not raw_chat_id:
         await update.message.reply_text("❌ Render Environment me TARGET_CHAT_ID set nahi hai.")
         return
 
-    context.user_data["waiting_for_file"] = False
+    quiz_data = context.user_data.get("temp_quiz_data")
+    quiz_name = context.user_data.get("temp_quiz_name")
 
-    # Preserve the paused quiz before switching to the newly uploaded quiz.
     archived_id = None
     if quiz_state and quiz_state.get("status") == "paused":
         archived_id = archive_current_quiz()
@@ -312,10 +210,11 @@ async def handle_json_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
 
     quiz_state = {
-        "quiz_name": Path(doc.file_name).stem,
+        "quiz_name": quiz_name,
         "chat_id": int(raw_chat_id),
         "quiz_data": quiz_data,
         "current_index": 0,
+        "timer": timer_val,
         "scores": {},
         "names": {},
         "status": "running",
@@ -325,12 +224,65 @@ async def handle_json_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     active_polls.clear()
     pause_event.set()
 
-    saved_note = f"\n🗂️ Purana quiz ID: {archived_id} ( /resume {archived_id} se wapas la sakte hain)." if archived_id else ""
+    saved_note = f"\n🗂️ Purana quiz save ho gaya (ID: `{archived_id}`)." if archived_id else ""
     await update.message.reply_text(
-        f"✅ JSON receive ho gayi! Total {len(quiz_data)} questions shuru ho rahe hain.{saved_note}"
+        f"🚀 *Quiz Start Ho Raha Hai!*\n\n"
+        f"📌 *Topic:* {quiz_name}\n"
+        f"📊 *Questions:* {len(quiz_data)}\n"
+        f"⏱️ *Timer:* {timer_val}s per question{saved_note}",
+        parse_mode="Markdown"
     )
     quiz_task = asyncio.create_task(run_quiz(context.bot))
 
+async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global quiz_state, quiz_task
+    if not is_admin(update):
+        await update.message.reply_text("❌ Sirf admin quiz restart kar sakta hai.")
+        return
+
+    if not quiz_state or not quiz_state.get("quiz_data"):
+        await update.message.reply_text("⚠️ Restart karne ke liye koi quiz loaded nahi hai.")
+        return
+
+    if quiz_task is not None and not quiz_task.done():
+        quiz_task.cancel()
+        try:
+            await quiz_task
+        except asyncio.CancelledError:
+            pass
+
+    quiz_state["current_index"] = 0
+    quiz_state["scores"] = {}
+    quiz_state["names"] = {}
+    quiz_state["status"] = "running"
+    save_state()
+    active_polls.clear()
+    pause_event.set()
+
+    await update.message.reply_text(f"🔄 *Quiz Restart ho gaya!* Q1 se shuru kiya ja raha hai...", parse_mode="Markdown")
+    quiz_task = asyncio.create_task(run_quiz(context.bot))
+
+async def share_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not quiz_state or not quiz_state.get("quiz_data"):
+        await update.message.reply_text("Abhi koi active quiz nahi hai jise share kiya ja sake.")
+        return
+
+    name = quiz_state.get("quiz_name", "Live Quiz")
+    total = quiz_state.get("total", len(quiz_state.get("quiz_data", [])))
+    timer = quiz_state.get("timer", DEFAULT_TIMER)
+    done = quiz_state.get("current_index", 0)
+
+    share_text = (
+        f"📢 *LIVE QUIZ ANNOUNCEMENT* 🎯\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📖 *Topic:* {name}\n"
+        f"📝 *Total Questions:* {total}\n"
+        f"⏱️ *Time per Question:* {timer} seconds\n"
+        f"📊 *Current Progress:* {done}/{total} Done\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"⚡ Sabhi candidates turant group join karke answers submit karein!"
+    )
+    await update.message.reply_text(share_text, parse_mode="Markdown")
 
 async def pause_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global quiz_state
@@ -344,10 +296,7 @@ async def pause_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     quiz_state["status"] = "paused"
     save_state()
     pause_event.clear()
-    await update.message.reply_text(
-        "⏸️ Quiz pause request save ho gayi. Current poll ka timer khatam hone ke baad agla question ruk jayega. /resume se jaari karein."
-    )
-
+    await update.message.reply_text("⏸️ Quiz pause ho gaya hai. Agla question ruk chuka hai. /resume se shuru karein.")
 
 async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global quiz_state, quiz_task
@@ -356,7 +305,7 @@ async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     requested_id = context.args[0] if context.args else None
-    # No ID: resume the currently paused quiz, if one exists.
+
     if quiz_state and quiz_state.get("status") == "paused" and not requested_id:
         quiz_state["status"] = "running"
         save_state()
@@ -364,14 +313,13 @@ async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if quiz_task is None or quiz_task.done():
             quiz_task = asyncio.create_task(run_quiz(context.bot))
         await update.message.reply_text(
-            f"▶️ Quiz resume ho gaya! Progress: {quiz_state['current_index']}/{quiz_state['total']} questions complete."
+            f"▶️ Quiz resume ho gaya! Question {quiz_state['current_index'] + 1}/{quiz_state['total']} se aage continue ho raha hai."
         )
         return
 
-    # An ID (or no active paused quiz) selects an archived quiz.
     row = get_saved_quiz(requested_id)
     if not row:
-        await update.message.reply_text("⚠️ Saved quiz nahi mila. /savedquizzes se IDs dekhein.")
+        await update.message.reply_text("⚠️ Saved quiz nahi mila. /savedquizzes dekhein.")
         return
 
     if quiz_state and quiz_state.get("status") == "running":
@@ -395,11 +343,7 @@ async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except asyncio.CancelledError:
             pass
     quiz_task = asyncio.create_task(run_quiz(context.bot))
-    await update.message.reply_text(
-        f"▶️ {quiz_state.get('quiz_name', 'Purana Quiz')} resume ho gaya! "
-        f"Progress: {quiz_state.get('current_index', 0)}/{quiz_state.get('total', 0)}."
-    )
-
+    await update.message.reply_text(f"▶️ Saved Quiz `{selected_id}` resume ho gaya!")
 
 async def savedquizzes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
@@ -407,29 +351,29 @@ async def savedquizzes_command(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     rows = list_saved_quizzes()
     if not rows:
-        await update.message.reply_text("Koi archived quiz nahi hai.")
+        await update.message.reply_text("Koi saved quiz nahi hai.")
         return
-    lines = ["🗂️ Saved quizzes:"]
-    for quiz_id, name, done, total in rows:
-        lines.append(f"• {name} | ID: {quiz_id} | Progress: {done or 0}/{total or 0}")
-    lines.append("Resume: /resume ID")
-    await update.message.reply_text("\n".join(lines))
-
+    lines = ["🗂️ *Saved Quizzes Library:*"]
+    for q_id, name, done, total in rows:
+        lines.append(f"• `{q_id}` | *{name}* | Progress: {done or 0}/{total or 0}")
+    lines.append("\nResume karne ke liye: `/resume ID`")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not quiz_state:
-        await update.message.reply_text("Abhi koi quiz save nahi hai.")
+        await update.message.reply_text("Abhi koi active quiz nahi hai.")
         return
 
     done = quiz_state.get("current_index", 0)
     total = quiz_state.get("total", len(quiz_state.get("quiz_data", [])))
     status = quiz_state.get("status", "unknown")
     await update.message.reply_text(
-        f"📊 Quiz status: {status.upper()}\n"
-        f"✅ Questions completed: {done}/{total}\n"
-        f"👥 Participants: {len(quiz_state.get('names', {}))}"
+        f"📊 *Quiz Status:* `{status.upper()}`\n"
+        f"📖 *Topic:* {quiz_state.get('quiz_name', 'N/A')}\n"
+        f"✅ *Progress:* {done}/{total} Questions\n"
+        f"👥 *Active Participants:* {len(quiz_state.get('names', {}))}",
+        parse_mode="Markdown"
     )
-
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global quiz_state
@@ -443,31 +387,38 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     quiz_state["status"] = "stopped"
     save_state()
     pause_event.set()
-    await update.message.reply_text("⏹️ Quiz stop kar diya gaya hai. Is quiz ko /resume nahi kar sakte; naya quiz /newquiz se shuru karein.")
+    await update.message.reply_text("⏹️ Quiz band kar diya gaya hai.")
 
 
-# ---------------- Quiz runner ----------------
+# ---------------- Quiz Runner ----------------
 async def run_quiz(bot):
     global quiz_state
-
     if not quiz_state:
         return
 
     chat_id = quiz_state["chat_id"]
     quiz_data = quiz_state["quiz_data"]
     total_q = len(quiz_data)
+    timer = quiz_state.get("timer", DEFAULT_TIMER)
     mapping = {"A": 0, "B": 1, "C": 2, "D": 3}
 
     if quiz_state.get("current_index", 0) == 0:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=(
-                "🎯 *Quiz shuru ho raha hai!*\n\n"
-                f"📊 Total Questions: {total_q}\n"
-                f"⏱️ Time per Question: {QUESTION_TIMER}s"
-            ),
-            parse_mode="Markdown",
-        )
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "🔥 *QUIZ SHURU HO RAHA HAI!* 🔥\n"
+                    "━━━━━━━━━━━━━━━━━━\n"
+                    f"📖 *Topic:* {quiz_state.get('quiz_name', 'Mock Test')}\n"
+                    f"📊 *Questions:* {total_q}\n"
+                    f"⏱️ *Per Question Time:* {timer}s\n"
+                    "━━━━━━━━━━━━━━━━━━\n"
+                    "👉 Sabhi log sahi vikalp chunein!"
+                ),
+                parse_mode="Markdown",
+            )
+        except Exception as exc:
+            print(f"Start message error: {exc}")
 
     while quiz_state and quiz_state.get("current_index", 0) < total_q:
         await pause_event.wait()
@@ -475,12 +426,13 @@ async def run_quiz(bot):
         if not quiz_state or quiz_state.get("status") == "stopped":
             return
         if quiz_state.get("status") == "paused":
+            await asyncio.sleep(1)
             continue
 
         index = quiz_state["current_index"]
         item = quiz_data[index]
         q_num = item.get("number", index + 1)
-        q_text = f"Q{q_num}. {item.get('question', '')}"
+        q_text = f"[{index + 1}/{total_q}] Q{q_num}. {item.get('question', '')}"
         options_dict = item.get("options", {})
         options = [options_dict[k] for k in ("A", "B", "C", "D") if k in options_dict]
 
@@ -502,15 +454,14 @@ async def run_quiz(bot):
                 type="quiz",
                 correct_option_id=correct_index,
                 is_anonymous=False,
-                open_period=QUESTION_TIMER,
+                open_period=timer,
             )
             active_polls[poll_msg.poll.id] = correct_index
-            await asyncio.sleep(QUESTION_TIMER + 2)
+            await asyncio.sleep(timer + 2)
         except Exception as exc:
             print(f"Poll send error: {exc}")
             await asyncio.sleep(3)
 
-        # Current question is complete. Save next index before continuing.
         quiz_state["current_index"] = index + 1
         save_state()
 
@@ -518,18 +469,130 @@ async def run_quiz(bot):
         await send_leaderboard(bot, chat_id, total_q)
         quiz_state["status"] = "completed"
         save_state()
-        completed_id = save_completed_quiz()
-        print(f"Completed quiz archived for sharing. ID: {completed_id}")
 
 
 async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    answer = update.poll_answer
+    if not quiz_state:
+        return
 
-    # Poll answers from individual shared-quiz sessions
-    shared_info = share_poll_map.get(answer.poll_id)
-    if shared_info:
-        uid = shared_info["user_id"]
-        session = shared_sessions.get(uid)
-        if session is not None:
-            was_correct = session["answers"].get(answer.poll_id, False)
- 
+    answer = update.poll_answer
+    user = answer.user
+    full_name = f"{user.first_name} {user.last_name or ''}".strip()
+
+    if answer.poll_id not in active_polls:
+        return
+
+    correct_option_id = active_polls[answer.poll_id]
+    uid = str(user.id)
+    quiz_state.setdefault("names", {})[uid] = full_name
+    quiz_state.setdefault("scores", {}).setdefault(uid, 0)
+
+    if answer.option_ids and answer.option_ids[0] == correct_option_id:
+        quiz_state["scores"][uid] += 1
+
+    save_state()
+
+
+# ---------------- Stylish Leaderboard ----------------
+async def send_leaderboard(bot, chat_id, total_q):
+    names = quiz_state.get("names", {})
+    scores = quiz_state.get("scores", {})
+    quiz_name = quiz_state.get("quiz_name", "Test")
+
+    if not names:
+        await bot.send_message(chat_id=chat_id, text="🏁 Quiz samaapt! Kisi candidate ne attempt nahi kiya.")
+        return
+
+    sorted_users = sorted(names.keys(), key=lambda uid: scores.get(uid, 0), reverse=True)
+    topper_id = sorted_users[0]
+    topper_score = scores.get(topper_id, 0)
+    topper_pct = round((topper_score / total_q) * 100, 1) if total_q > 0 else 0
+
+    res = (
+        "╔════════════════════════╗\n"
+        "       🏆 *FINAL LEADERBOARD* 🏆\n"
+        "╚════════════════════════╝\n\n"
+        f"📖 *Quiz:* {quiz_name}\n"
+        f"📊 *Total Questions:* {total_q}\n"
+        f"👥 *Total Participants:* {len(sorted_users)}\n"
+        "────────────────────────\n\n"
+        f"👑 *TOP PERFORMER*\n"
+        f"🥇 *{names[topper_id]}*\n"
+        f"🎯 *Score:* `{topper_score}/{total_q}` ({topper_pct}%)\n"
+        "🌟 _Outstanding Performance!_ 👏\n\n"
+        "📋 *TOP CANDIDATES RANKING:*\n"
+    )
+
+    rank_icons = {1: "🥇", 2: "🥈", 3: "🥉"}
+    for rank, uid in enumerate(sorted_users[:15], start=1):
+        sc = scores.get(uid, 0)
+        pct = round((sc / total_q) * 100, 1) if total_q > 0 else 0
+        icon = rank_icons.get(rank, f"`#{rank:02d}`")
+        res += f"{icon} *{names[uid]}* ➔ `{sc}/{total_q}` ({pct}%)\n"
+
+    res += (
+        "\n────────────────────────\n"
+        "✨ _Shandar prayas! Agle quiz ki taiyari jaari rakhein._ 📚"
+    )
+
+    await bot.send_message(chat_id=chat_id, text=res, parse_mode="Markdown")
+
+
+# ---------------- Startup / Errors ----------------
+async def restore_quiz(application):
+    global quiz_state, quiz_task
+    quiz_state = load_state()
+
+    if quiz_state and quiz_state.get("status") == "running":
+        pause_event.set()
+        quiz_task = asyncio.create_task(run_quiz(application.bot))
+        print(">> Running quiz SQLite se restore ho gaya.")
+    elif quiz_state and quiz_state.get("status") == "paused":
+        pause_event.clear()
+        print(">> Quiz paused hai. /resume se continue karein.")
+    else:
+        pause_event.set()
+
+async def error_handler(update, context):
+    print(f">> Telegram Error: {context.error}")
+
+
+def main():
+    token = os.environ.get("BOT_TOKEN")
+    if not token:
+        print("❌ CRITICAL ERROR: BOT_TOKEN Environment variable set nahi hai!")
+        while True:
+            time.sleep(3600)
+
+    init_db()
+
+    app = (
+        ApplicationBuilder()
+        .token(token)
+        .connect_timeout(30.0)
+        .read_timeout(30.0)
+        .write_timeout(30.0)
+        .pool_timeout(30.0)
+        .post_init(restore_quiz)
+        .build()
+    )
+
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("newquiz", ask_for_quiz_file))
+    app.add_handler(CommandHandler("restart", restart_command))
+    app.add_handler(CommandHandler("share", share_command))
+    app.add_handler(CommandHandler("pause", pause_command))
+    app.add_handler(CommandHandler("resume", resume_command))
+    app.add_handler(CommandHandler("savedquizzes", savedquizzes_command))
+    app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("stop", stop_command))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_json_file))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_messages))
+    app.add_handler(PollAnswerHandler(handle_poll_answer))
+    app.add_error_handler(error_handler)
+
+    print(">> Telegram Quiz Bot polling shuru ho chuki hai...")
+    app.run_polling(drop_pending_updates=False)
+
+if __name__ == "__main__":
+    main()
